@@ -1,6 +1,6 @@
 # Tidepool
 
-Tidepool collects event posts pushed by an n8n workflow and serves them as a JSON API protected by API keys. It also has a password-protected admin UI for reviewing, editing and deleting posts and for managing API keys.
+Tidepool collects event posts pushed by an n8n workflow and serves them as a JSON API protected by API keys. It shows upcoming events on a public feed at `/`, and has a password-protected admin UI at `/admin` for reviewing, editing and deleting posts and for managing API keys.
 
 It runs as a Docker container on the same host as [Pangolin](https://github.com/fosrl/pangolin), on Pangolin's Docker network. Pangolin's Traefik serves it over HTTPS through a Local site (no Newt tunnel).
 
@@ -52,7 +52,7 @@ In the Pangolin dashboard, create an HTTP resource on your **Local** site:
 
 `ORIGIN` must be exactly that HTTPS URL. SvelteKit rejects form submissions from any other origin.
 
-Pangolin puts its own login in front of resources by default. The admin UI has its own password, and API clients authenticate with a Bearer key, which Pangolin's login would block. Either turn off Pangolin authentication for this resource, or keep it and add rules that bypass it for the API paths (`/posts` and `/posts/*`).
+Pangolin puts its own login in front of resources by default. **Turn off Pangolin authentication for this resource**: the public feed must be reachable by anyone, the admin UI has its own password, and API clients authenticate with a Bearer key, which Pangolin's login would block.
 
 Behind Traefik, every request appears to come from Traefik's IP. Login is limited to 5 failed attempts per IP per 15 minutes, so tell Tidepool to read the client IP from the header Traefik sets. Otherwise one person mistyping locks everyone out. Add to `.env`:
 
@@ -66,6 +66,14 @@ This trusts only the address Traefik itself appended, so clients cannot forge it
 ### Sessions
 
 Sessions last 7 days. Logging out clears the cookie in that browser. To invalidate every session, for example after a leaked cookie, change `SESSION_SECRET` and restart.
+
+## Public feed
+
+`/` lists every event that hasn't ended yet, soonest first, 5 at a time, and loads more as you scroll. An event without an `end` drops off once it starts. Each card shows the poster, title, time, location and summary, and links to the original post. Times are shown in the event's own UTC offset, the local time at the venue.
+
+The feed needs no login. It loads further pages from `/events?cursor=...` and posters from `/events/:id/image`, which are public too. Without JavaScript, a **More events** link pages through the feed instead.
+
+The admin UI is at `/admin`.
 
 ## n8n
 
@@ -112,6 +120,32 @@ In n8n, download the image with an HTTP Request node (Response Format **File**),
 A 5 MB image is about 7 MB once base64-encoded, more than adapter-node's default 512 KB request limit, so `docker-compose.yml` sets `BODY_SIZE_LIMIT=10M`. A request body over 10 MB is rejected by the server with **413** before Tidepool validates it.
 
 Images are stored in the SQLite database, so deleting a post also deletes its image.
+
+### Skipping posts already seen
+
+Tidepool remembers every post n8n has classified, so the workflow only sends new posts to classification. Use a write key for all three calls.
+
+1. **Check** which of the scraped posts are new, up to 100 ids per call. `unseen_ids` keeps your order:
+
+   ```sh
+   curl -X POST -H "Authorization: Bearer tp_..." -H "Content-Type: application/json" \
+     -d '{"source": "instagram", "source_ids": ["DYD1txkPDsA", "DYC9abcDEFg"]}' \
+     http://tidepool:3000/seen/check
+   # {"unseen_ids": ["DYC9abcDEFg"]}
+   ```
+
+2. **Classify** only the unseen posts.
+3. **Record** the result:
+   - An event: `POST /posts` as above. Creating the post marks it seen.
+   - Not an event: `POST /seen`. It returns **200** `{"seen": true}`, also when the post was already seen.
+
+     ```json
+     { "source": "instagram", "source_id": "DYC9abcDEFg", "outcome": "not_event" }
+     ```
+
+`POST /seen` only accepts `not_event` and returns **400** otherwise, since events must go through `POST /posts`. `POST /seen/check` needs a read key, `POST /seen` a write key.
+
+A post deleted in the admin UI stays seen, so a false positive is never imported again. Posts that existed before seen-tracking was added are marked seen as events when the database is migrated.
 
 ## Reading the API
 

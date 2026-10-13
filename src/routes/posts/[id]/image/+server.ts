@@ -1,6 +1,6 @@
 import { error, type Cookies } from '@sveltejs/kit';
 import { authenticateApiKey } from '$lib/server/api-keys';
-import { getPostImage } from '$lib/server/images';
+import { getPostImage, imageResponse } from '$lib/server/images';
 import { isValidSession, SESSION_COOKIE } from '$lib/server/session';
 import { idSchema, parseOrBadRequest } from '$lib/server/validation';
 import type { RequestHandler } from './$types';
@@ -20,12 +20,5 @@ export const GET: RequestHandler = ({ request, cookies, params }) => {
 	authorizeImageRequest(request, cookies, new Date());
 	const image = getPostImage(parseOrBadRequest(idSchema, params.id));
 	if (image === undefined) error(404, 'Image not found');
-	return new Response(new Uint8Array(image.data), {
-		headers: {
-			'content-type': image.mime,
-			'content-length': String(image.data.length),
-			'cache-control': 'private, max-age=86400',
-			'x-content-type-options': 'nosniff'
-		}
-	});
+	return imageResponse(image, 'private, max-age=86400');
 };

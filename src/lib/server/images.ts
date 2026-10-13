@@ -81,3 +81,15 @@ export function getPostImage(postId: number): ImageUpload | undefined {
 		.where(eq(postImages.postId, postId))
 		.get();
 }
+
+/** Serves a stored image as-is; `cacheControl` differs between the API and the public feed. */
+export function imageResponse(image: ImageUpload, cacheControl: string): Response {
+	return new Response(new Uint8Array(image.data), {
+		headers: {
+			'content-type': image.mime,
+			'content-length': String(image.data.length),
+			'cache-control': cacheControl,
+			'x-content-type-options': 'nosniff'
+		}
+	});
+}

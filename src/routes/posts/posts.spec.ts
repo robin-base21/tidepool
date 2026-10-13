@@ -3,11 +3,15 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createApiKey } from '$lib/server/api-keys';
 import { loadConfig } from '$lib/server/config';
 import { openDatabase } from '$lib/server/db';
-import { updatePost, type PostResource } from '$lib/server/posts';
+import { deletePost, updatePost, type PostResource } from '$lib/server/posts';
 import { SESSION_COOKIE, startSession } from '$lib/server/session';
 import { GET as getPosts, POST as postPosts } from './+server';
 import { GET as getPostById } from './[id]/+server';
 import { GET as getPostImage } from './[id]/image/+server';
+import { GET as getPublicEvents } from '../events/+server';
+import { GET as getPublicImage } from '../events/[id]/image/+server';
+import { POST as postSeen } from '../seen/+server';
+import { POST as postSeenCheck } from '../seen/check/+server';
 
 const PNG_BYTES = Buffer.from(
 	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
@@ -512,5 +516,158 @@ describe('images', () => {
 			});
 			expect(response).toEqual({ status: 404, body: { message: 'Image not found' } });
 		});
+	});
+});
+
+describe('public feed', () => {
+	it('lists upcoming events without a key', async () => {
+		await call(postPosts, {
+			method: 'POST',
+			path: '/posts',
+			key: writeKey,
+			body: postBody({ start: '2999-01-01T00:00:00Z' })
+		});
+		const response = await call(getPublicEvents, { method: 'GET', path: '/events' });
+		expect(response.status).toBe(200);
+		expect(response.body.events.map((event: { title: string }) => event.title)).toEqual([
+			'Night market'
+		]);
+		expect(response.body.nextCursor).toBeNull();
+	});
+
+	it('rejects a bad cursor with 400', async () => {
+		const response = await call(getPublicEvents, { method: 'GET', path: '/events?cursor=nope' });
+		expect(response).toEqual({ status: 400, body: { message: 'cursor: is not a valid cursor' } });
+	});
+
+	it('serves images without a key, cacheable publicly', async () => {
+		const created = await call(postPosts, {
+			method: 'POST',
+			path: '/posts',
+			key: writeKey,
+			body: postBody()
+		});
+		const response = await respond(getPublicImage, {
+			method: 'GET',
+			path: `/events/${created.body.id}/image`,
+			params: { id: String(created.body.id) }
+		});
+		if (!(response instanceof Response))
+			throw new Error(`Expected a Response, got ${response.status}`);
+		expect(response.headers.get('cache-control')).toBe('public, max-age=86400');
+		expect(Buffer.from(await response.arrayBuffer())).toEqual(PNG_BYTES);
+	});
+});
+
+describe('seen tracking', () => {
+	async function unseenIds(sourceIds: string[], source = 'instagram'): Promise<string[]> {
+		const response = await call(postSeenCheck, {
+			method: 'POST',
+			path: '/seen/check',
+			key: readKey,
+			body: JSON.stringify({ source, source_ids: sourceIds })
+		});
+		expect(response.status).toBe(200);
+		return response.body.unseen_ids;
+	}
+
+	async function markNotEvent(sourceId: string) {
+		return call(postSeen, {
+			method: 'POST',
+			path: '/seen',
+			key: writeKey,
+			body: JSON.stringify({ source: 'instagram', source_id: sourceId, outcome: 'not_event' })
+		});
+	}
+
+	async function createPost(sourceId: string) {
+		return call(postPosts, {
+			method: 'POST',
+			path: '/posts',
+			key: writeKey,
+			body: postBody({ source_id: sourceId })
+		});
+	}
+
+	it('returns only unseen ids, in input order', async () => {
+		await createPost('event1');
+		expect(await markNotEvent('meme1')).toEqual({ status: 200, body: { seen: true } });
+
+		expect(await unseenIds(['new2', 'event1', 'new1', 'meme1', 'new3'])).toEqual([
+			'new2',
+			'new1',
+			'new3'
+		]);
+		expect(await unseenIds(['event1', 'meme1'], 'tiktok')).toEqual(['event1', 'meme1']);
+	});
+
+	it('marks a post seen when POST /posts creates it', async () => {
+		expect(await unseenIds(['DYD1txkPDsA'])).toEqual(['DYD1txkPDsA']);
+		expect((await createPost('DYD1txkPDsA')).status).toBe(201);
+		expect(await unseenIds(['DYD1txkPDsA'])).toEqual([]);
+	});
+
+	it('turns an earlier not_event into an event when the post is created after all', async () => {
+		await markNotEvent('changed-mind');
+		expect((await createPost('changed-mind')).status).toBe(201);
+		expect(await unseenIds(['changed-mind'])).toEqual([]);
+	});
+
+	it('accepts marking the same post twice', async () => {
+		await markNotEvent('meme');
+		expect(await markNotEvent('meme')).toEqual({ status: 200, body: { seen: true } });
+	});
+
+	it('rejects outcome event on POST /seen', async () => {
+		const response = await call(postSeen, {
+			method: 'POST',
+			path: '/seen',
+			key: writeKey,
+			body: JSON.stringify({ source: 'instagram', source_id: 'x', outcome: 'event' })
+		});
+		expect(response).toEqual({
+			status: 400,
+			body: { message: 'outcome: must be "not_event"; events are marked seen by POST /posts' }
+		});
+		expect(await unseenIds(['x'])).toEqual(['x']);
+	});
+
+	it('keeps a deleted post seen', async () => {
+		const created = await createPost('false-positive');
+		expect(deletePost(created.body.id)).toBe(true);
+		expect(await unseenIds(['false-positive'])).toEqual([]);
+	});
+
+	it('needs a write key to mark and a read key to check', async () => {
+		const marked = await call(postSeen, {
+			method: 'POST',
+			path: '/seen',
+			key: readKey,
+			body: JSON.stringify({ source: 'instagram', source_id: 'x', outcome: 'not_event' })
+		});
+		expect(marked.status).toBe(403);
+		const checked = await call(postSeenCheck, {
+			method: 'POST',
+			path: '/seen/check',
+			body: JSON.stringify({ source: 'instagram', source_ids: ['x'] })
+		});
+		expect(checked.status).toBe(401);
+	});
+
+	it('accepts 1 to 100 ids', async () => {
+		const tooMany = Array.from({ length: 101 }, (_, index) => `id${index}`);
+		for (const sourceIds of [[], tooMany]) {
+			const response = await call(postSeenCheck, {
+				method: 'POST',
+				path: '/seen/check',
+				key: readKey,
+				body: JSON.stringify({ source: 'instagram', source_ids: sourceIds })
+			});
+			expect(response).toEqual({
+				status: 400,
+				body: { message: 'source_ids: must contain 1 to 100 ids' }
+			});
+		}
+		expect(await unseenIds(tooMany.slice(0, 100))).toHaveLength(100);
 	});
 });

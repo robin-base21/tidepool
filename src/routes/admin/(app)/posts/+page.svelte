@@ -138,8 +138,8 @@
 			<AlertDialog.Header>
 				<AlertDialog.Title>Delete this post?</AlertDialog.Title>
 				<AlertDialog.Description>
-					“{postToDelete?.title}” will be removed permanently. If n8n sends it again it will be
-					re-created as new.
+					“{postToDelete?.title}” will be removed permanently. It stays marked as seen, so n8n won’t
+					import it again.
 				</AlertDialog.Description>
 			</AlertDialog.Header>
 			<input type="hidden" name="id" value={postToDelete?.id} />

@@ -15,14 +15,9 @@ import {
 import { z } from 'zod';
 import { getConfig } from './config';
 import { db } from './db';
-import { postImages, posts, type Post } from './db/schema';
+import { postImages, posts, seenPosts, type Post } from './db/schema';
 import { imageDataUrlSchema } from './images';
-import { isoDateTimeWithOffset, requiredOr } from './validation';
-
-const requiredText = z
-	.string({ error: requiredOr('must be a string') })
-	.trim()
-	.min(1, 'must not be empty');
+import { isoDateTimeWithOffset, requiredOr, requiredText } from './validation';
 
 function endNotBeforeStart(input: { start: string; end: string | null }): boolean {
 	return input.end === null || Date.parse(input.end) >= Date.parse(input.start);
@@ -69,11 +64,13 @@ export type PostEdit = z.output<typeof postEditSchema>;
 
 const cursorSchema = z.tuple([z.number().int(), z.number().int().positive()]);
 
+type Cursor = z.output<typeof cursorSchema>;
+
 function encodeCursor(startSeconds: number, id: number): string {
 	return Buffer.from(JSON.stringify([startSeconds, id])).toString('base64url');
 }
 
-function decodeCursor(cursor: string): z.output<typeof cursorSchema> | null {
+function decodeCursor(cursor: string): Cursor | null {
 	try {
 		const result = cursorSchema.safeParse(JSON.parse(Buffer.from(cursor, 'base64url').toString()));
 		return result.success ? result.data : null;
@@ -81,6 +78,15 @@ function decodeCursor(cursor: string): z.output<typeof cursorSchema> | null {
 		return null;
 	}
 }
+
+const cursorParamSchema = z.string().transform((cursor, context) => {
+	const decoded = decodeCursor(cursor);
+	if (decoded === null) {
+		context.addIssue({ code: 'custom', message: 'is not a valid cursor' });
+		return z.NEVER;
+	}
+	return decoded;
+});
 
 export const listPostsQuerySchema = z.strictObject({
 	start_from: isoDateTimeWithOffset.optional(),
@@ -93,17 +99,7 @@ export const listPostsQuerySchema = z.strictObject({
 		.min(1, 'must be between 1 and 200')
 		.max(200, 'must be between 1 and 200')
 		.default(50),
-	cursor: z
-		.string()
-		.transform((cursor, context) => {
-			const decoded = decodeCursor(cursor);
-			if (decoded === null) {
-				context.addIssue({ code: 'custom', message: 'is not a valid cursor' });
-				return z.NEVER;
-			}
-			return decoded;
-		})
-		.optional()
+	cursor: cursorParamSchema.optional()
 });
 
 export type ListPostsQuery = z.output<typeof listPostsQuerySchema>;
@@ -167,9 +163,40 @@ function instant(isoDateTime: string): SQL<number> {
 	return sql<number>`unixepoch(${isoDateTime})`;
 }
 
+/** One page ordered by the instant of start, then id, continuing after `cursor`. */
+function listPageByStart(
+	conditions: SQL[],
+	cursor: Cursor | undefined,
+	limit: number
+): { posts: PostWithImageFlag[]; nextCursor: string | null } {
+	if (cursor !== undefined) {
+		const [afterStart, afterId] = cursor;
+		const afterCursor = or(
+			gt(startInstant, afterStart),
+			and(eq(startInstant, afterStart), gt(posts.id, afterId))
+		);
+		if (afterCursor !== undefined) conditions.push(afterCursor);
+	}
+
+	const rows = db()
+		.select({ post: postWithImageFlag, startSeconds: startInstant })
+		.from(posts)
+		.where(and(...conditions))
+		.orderBy(asc(startInstant), asc(posts.id))
+		.limit(limit + 1)
+		.all();
+
+	const page = rows.slice(0, limit);
+	const last = page[page.length - 1];
+	return {
+		posts: page.map((row) => row.post),
+		nextCursor: rows.length > limit ? encodeCursor(last.startSeconds, last.post.id) : null
+	};
+}
+
 /**
- * Inserts a new post with its image. An existing (source, source_id) is returned unchanged,
- * image included, so admin edits survive re-sends.
+ * Inserts a new post with its image and marks it seen as an event. An existing
+ * (source, source_id) is returned unchanged, image included, so admin edits survive re-sends.
  */
 export function createPostIfAbsent(
 	input: NewPost,
@@ -201,6 +228,20 @@ export function createPostIfAbsent(
 			.insert(postImages)
 			.values({ postId: inserted.id, mime: input.image.mime, data: input.image.data })
 			.run();
+		// A deleted post or an earlier not_event may already be seen; it is an event now.
+		transaction
+			.insert(seenPosts)
+			.values({
+				source: input.source,
+				sourceId: input.source_id,
+				outcome: 'event',
+				seenAt: timestamp
+			})
+			.onConflictDoUpdate({
+				target: [seenPosts.source, seenPosts.sourceId],
+				set: { outcome: 'event' }
+			})
+			.run();
 		return true;
 	});
 
@@ -226,28 +267,54 @@ export function listPostsForApi(query: ListPostsQuery): {
 	}
 	if (query.source_account !== undefined)
 		conditions.push(eq(posts.sourceAccount, query.source_account));
-	if (query.cursor !== undefined) {
-		const [afterStart, afterId] = query.cursor;
-		const afterCursor = or(
-			gt(startInstant, afterStart),
-			and(eq(startInstant, afterStart), gt(posts.id, afterId))
-		);
-		if (afterCursor !== undefined) conditions.push(afterCursor);
-	}
 
-	const rows = db()
-		.select({ post: postWithImageFlag, startSeconds: startInstant })
-		.from(posts)
-		.where(and(...conditions))
-		.orderBy(asc(startInstant), asc(posts.id))
-		.limit(query.limit + 1)
-		.all();
+	const page = listPageByStart(conditions, query.cursor, query.limit);
+	return { posts: page.posts.map(toPostResource), next_cursor: page.nextCursor };
+}
 
-	const page = rows.slice(0, query.limit);
-	const last = page[page.length - 1];
+export const PUBLIC_FEED_PAGE_SIZE = 5;
+
+export const publicFeedQuerySchema = z.object({ cursor: cursorParamSchema.optional() });
+
+export type PublicFeedQuery = z.output<typeof publicFeedQuerySchema>;
+
+/** The fields shown on the public feed; source identifiers and timestamps stay internal. */
+export type PublicEvent = {
+	id: number;
+	title: string;
+	start: string;
+	end: string | null;
+	location: string | null;
+	summary: string | null;
+	sourceUrl: string;
+	sourceAccount: string;
+	hasImage: boolean;
+};
+
+export type PublicFeedPage = { events: PublicEvent[]; nextCursor: string | null };
+
+/** An event stays in the feed until it ends, or until it starts when it has no end. */
+const endInstant = sql<number>`unixepoch(coalesce(${posts.end}, ${posts.start}))`;
+
+export function listPublicEvents(query: PublicFeedQuery, now: Date): PublicFeedPage {
+	const page = listPageByStart(
+		[gte(endInstant, instant(now.toISOString()))],
+		query.cursor,
+		PUBLIC_FEED_PAGE_SIZE
+	);
 	return {
-		posts: page.map((row) => toPostResource(row.post)),
-		next_cursor: rows.length > query.limit ? encodeCursor(last.startSeconds, last.post.id) : null
+		events: page.posts.map((post) => ({
+			id: post.id,
+			title: post.title,
+			start: post.start,
+			end: post.end,
+			location: post.location,
+			summary: post.summary,
+			sourceUrl: post.sourceUrl,
+			sourceAccount: post.sourceAccount,
+			hasImage: post.hasImage
+		})),
+		nextCursor: page.nextCursor
 	};
 }
 

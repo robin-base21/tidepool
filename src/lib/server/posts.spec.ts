@@ -3,7 +3,15 @@ import { count } from 'drizzle-orm';
 import { db, openDatabase } from './db';
 import { postImages } from './db/schema';
 import { getPostImage } from './images';
-import { createPostIfAbsent, deletePost, getDashboardStats, type NewPost } from './posts';
+import {
+	createPostIfAbsent,
+	deletePost,
+	getDashboardStats,
+	listPublicEvents,
+	publicFeedQuerySchema,
+	type NewPost,
+	type PublicFeedPage
+} from './posts';
 
 const PNG_BYTES = Buffer.from(
 	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
@@ -80,5 +88,75 @@ describe('getDashboardStats', () => {
 			{ sourceAccount: 'b', posts: 4 },
 			{ sourceAccount: 'a', posts: 2 }
 		]);
+	});
+});
+
+describe('listPublicEvents', () => {
+	const now = new Date('2026-10-13T12:00:00Z');
+
+	function titles(page: PublicFeedPage): string[] {
+		return page.events.map((event) => event.title);
+	}
+
+	function nextPage(page: PublicFeedPage): PublicFeedPage {
+		return listPublicEvents(publicFeedQuerySchema.parse({ cursor: page.nextCursor }), now);
+	}
+
+	beforeEach(() => openDatabase(':memory:'));
+
+	it('keeps events until they end, or until they start when they have no end', () => {
+		const ended = newPost('ended', 'a', '2026-10-13T08:00:00Z');
+		createPostIfAbsent({ ...ended, end: '2026-10-13T11:59:59Z' }, now);
+		createPostIfAbsent(newPost('started', 'a', '2026-10-13T11:00:00Z'), now);
+		const ongoing = newPost('ongoing', 'a', '2026-10-13T20:00:00+09:00'); // 11:00Z
+		createPostIfAbsent({ ...ongoing, end: '2026-10-14T02:00:00+09:00' }, now);
+		createPostIfAbsent(newPost('now', 'a', '2026-10-13T12:00:00Z'), now);
+		createPostIfAbsent(newPost('later', 'a', '2026-10-20T00:00:00Z'), now);
+
+		expect(titles(listPublicEvents({}, now))).toEqual([
+			'Event ongoing',
+			'Event now',
+			'Event later'
+		]);
+	});
+
+	it('pages 5 at a time, soonest first, until every event was shown once', () => {
+		for (let day = 30; day >= 14; day--) {
+			createPostIfAbsent(newPost(`d${day}`, 'a', `2026-10-${day}T00:00:00Z`), now);
+		}
+
+		const shown: string[] = [];
+		let page = listPublicEvents({}, now);
+		const pageSizes = [page.events.length];
+		shown.push(...titles(page));
+		while (page.nextCursor !== null) {
+			page = nextPage(page);
+			pageSizes.push(page.events.length);
+			shown.push(...titles(page));
+		}
+
+		expect(pageSizes).toEqual([5, 5, 5, 2]);
+		expect(shown).toEqual(Array.from({ length: 17 }, (_, index) => `Event d${index + 14}`));
+	});
+
+	it('exposes only the fields the feed shows', () => {
+		createPostIfAbsent(newPost('x', 'base21.space', '2026-10-20T20:00:00+09:00'), now);
+		expect(listPublicEvents({}, now).events).toEqual([
+			{
+				id: 1,
+				title: 'Event x',
+				start: '2026-10-20T20:00:00+09:00',
+				end: null,
+				location: null,
+				summary: null,
+				sourceUrl: 'https://www.instagram.com/p/x/',
+				sourceAccount: 'base21.space',
+				hasImage: true
+			}
+		]);
+	});
+
+	it('rejects an invalid cursor', () => {
+		expect(publicFeedQuerySchema.safeParse({ cursor: 'nope' }).success).toBe(false);
 	});
 });

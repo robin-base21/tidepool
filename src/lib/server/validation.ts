@@ -6,6 +6,11 @@ export function requiredOr(message: string) {
 	return (issue: { input?: unknown }) => (issue.input === undefined ? 'is required' : message);
 }
 
+export const requiredText = z
+	.string({ error: requiredOr('must be a string') })
+	.trim()
+	.min(1, 'must not be empty');
+
 export const isoDateTimeWithOffset = z.iso.datetime({
 	offset: true,
 	error: requiredOr(

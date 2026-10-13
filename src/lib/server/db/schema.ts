@@ -1,5 +1,13 @@
 import { sql } from 'drizzle-orm';
-import { blob, index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import {
+	blob,
+	index,
+	integer,
+	primaryKey,
+	sqliteTable,
+	text,
+	uniqueIndex
+} from 'drizzle-orm/sqlite-core';
 
 export const posts = sqliteTable(
 	'posts',
@@ -35,6 +43,23 @@ export const postImages = sqliteTable('post_images', {
 	mime: text('mime', { enum: imageMimeTypes }).notNull(),
 	data: blob('data', { mode: 'buffer' }).notNull()
 });
+
+export const seenOutcomes = ['event', 'not_event'] as const;
+
+/**
+ * Every source post n8n has classified, so it can skip them next time. Not tied to `posts`:
+ * deleting a post keeps it seen, so a deleted false positive is never imported again.
+ */
+export const seenPosts = sqliteTable(
+	'seen_posts',
+	{
+		source: text('source').notNull(),
+		sourceId: text('source_id').notNull(),
+		outcome: text('outcome', { enum: seenOutcomes }).notNull(),
+		seenAt: text('seen_at').notNull()
+	},
+	(table) => [primaryKey({ columns: [table.source, table.sourceId] })]
+);
 
 export const apiKeys = sqliteTable('api_keys', {
 	id: integer('id').primaryKey({ autoIncrement: true }),
