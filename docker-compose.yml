@@ -1,0 +1,19 @@
+services:
+  tidepool:
+    build: .
+    container_name: tidepool
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Posts carry a base64 image of up to 5 MB (about 7 MB encoded); adapter-node's default is 512K.
+      BODY_SIZE_LIMIT: 10M
+    volumes:
+      - ./data:/data
+    ports:
+      - '3456:3000'
+    networks:
+      - umbrel_main_network
+
+networks:
+  umbrel_main_network:
+    external: true
