@@ -9,11 +9,10 @@ services:
       BODY_SIZE_LIMIT: 10M
     volumes:
       - ./data:/data
-    ports:
-      - '3456:3000'
+    # No published port: Pangolin's Traefik reaches http://tidepool:3000 over this network.
     networks:
-      - umbrel_main_network
+      - pangolin
 
 networks:
-  umbrel_main_network:
+  pangolin:
     external: true

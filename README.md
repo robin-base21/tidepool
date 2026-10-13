@@ -2,9 +2,9 @@
 
 Tidepool collects event posts pushed by an n8n workflow and serves them as a JSON API protected by API keys. It also has a password-protected admin UI for reviewing, editing and deleting posts and for managing API keys.
 
-It runs as a Docker container on an Umbrel home server, on the same Docker network as n8n.
+It runs as a Docker container on the same host as [Pangolin](https://github.com/fosrl/pangolin), on Pangolin's Docker network. Pangolin's Traefik serves it over HTTPS through a Local site (no Newt tunnel).
 
-## Setup on Umbrel
+## Setup
 
 The admin UI must be served over **HTTPS**. The session cookie is `Secure`, so browsers will not keep it over plain HTTP, and form submissions are checked against `ORIGIN`.
 
@@ -41,24 +41,27 @@ The admin UI must be served over **HTTPS**. The session cookie is `Secure`, so b
 
 On startup the container runs database migrations. It exits with a clear message if any required environment variable is missing or invalid; check with `sudo docker compose logs tidepool`.
 
-The admin UI is published on port `3456`. n8n reaches the API at `http://tidepool:3000/posts` over the `umbrel_main_network` Docker network.
+Tidepool publishes no host port. It joins the external `pangolin` Docker network that Pangolin's installer creates (check the name with `sudo docker network ls`), and Traefik reaches it there at `http://tidepool:3000`. Containers on the same network, such as n8n, reach the API at `http://tidepool:3000/posts`.
 
-### Reverse proxy
+### Pangolin
 
-`ORIGIN` must be the HTTPS URL you open in the browser, for example the hostname your reverse proxy or tunnel serves. Point the proxy at `http://<umbrel>:3456` (or at `http://tidepool:3000` if the proxy is on `umbrel_main_network`).
+In the Pangolin dashboard, create an HTTP resource on your **Local** site:
 
-Behind a proxy, every request appears to come from the proxy's IP. Login is limited to 5 failed attempts per IP per 15 minutes, so tell Tidepool which header holds the real client IP. Otherwise one person mistyping locks everyone out. Add one of these to `.env`, depending on your proxy:
+- Domain: the hostname you put in `ORIGIN`, for example `tidepool.example.com`
+- Target: method `http`, host `tidepool`, port `3000`
+
+`ORIGIN` must be exactly that HTTPS URL. SvelteKit rejects form submissions from any other origin.
+
+Pangolin puts its own login in front of resources by default. The admin UI has its own password, and API clients authenticate with a Bearer key, which Pangolin's login would block. Either turn off Pangolin authentication for this resource, or keep it and add rules that bypass it for the API paths (`/posts` and `/posts/*`).
+
+Behind Traefik, every request appears to come from Traefik's IP. Login is limited to 5 failed attempts per IP per 15 minutes, so tell Tidepool to read the client IP from the header Traefik sets. Otherwise one person mistyping locks everyone out. Add to `.env`:
 
 ```sh
-# Cloudflare Tunnel
-ADDRESS_HEADER=CF-Connecting-IP
-
-# nginx, Caddy, Traefik, Nginx Proxy Manager: one proxy in front of Tidepool
 ADDRESS_HEADER=X-Forwarded-For
 XFF_DEPTH=1
 ```
 
-Only set these when every request passes through that proxy; clients can forge these headers otherwise. The rate limit is held in memory, so restarting the container clears it.
+This trusts only the address Traefik itself appended, so clients cannot forge it. Change `XFF_DEPTH` if you add another proxy, such as Cloudflare, in front of Pangolin. The rate limit is held in memory, so restarting the container clears it.
 
 ### Sessions
 
